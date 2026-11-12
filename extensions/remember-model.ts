@@ -18,6 +18,18 @@ interface SavedConfig {
   thinkingLevel: ThinkingLevel;
 }
 
+const THINKING_LEVELS = new Set<unknown>([
+  "off", "minimal", "low", "medium", "high", "xhigh", "max",
+]);
+
+function isSavedConfig(value: unknown): value is SavedConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const config = value as Record<string, unknown>;
+  return typeof config.provider === "string" && config.provider.trim().length > 0 &&
+    typeof config.model === "string" && config.model.trim().length > 0 &&
+    THINKING_LEVELS.has(config.thinkingLevel);
+}
+
 /**
  * True when the user selected a model explicitly on the command line
  * (`--model`, `--provider`, or `--models`). Pi exposes no event field for this,
@@ -27,12 +39,16 @@ interface SavedConfig {
 function hasExplicitModelArg(
   argv: readonly string[] = process.argv,
 ): boolean {
-  return argv.some(
-    (arg) => arg === "--model" || arg === "--provider" || arg === "--models",
+  const args = argv.slice(2);
+  const separator = args.indexOf("--");
+  return (separator < 0 ? args : args.slice(0, separator)).some(
+    (arg) => /^(--model|--provider|--models)(=|$)/.test(arg),
   );
 }
 
 export default function rememberModelAndThinking(pi: ExtensionAPI) {
+  if (process.env.PI_REMEMBER_MODEL_DISABLE === "1") return;
+
   const stateFile = join(getAgentDir(), "last-model.json");
 
   let lastConfig: SavedConfig | undefined;
@@ -54,16 +70,15 @@ export default function rememberModelAndThinking(pi: ExtensionAPI) {
 
   if (existsSync(stateFile)) {
     try {
-      lastConfig = JSON.parse(
-        readFileSync(stateFile, "utf-8"),
-      ) as SavedConfig;
+      const parsed: unknown = JSON.parse(readFileSync(stateFile, "utf-8"));
+      if (isSavedConfig(parsed)) lastConfig = parsed;
     } catch {
       // ignora stato non valido
     }
   }
 
-  pi.on("model_select", async (event) => {
-    if (restoring || event.source === "restore") {
+  pi.on("model_select", async (event, ctx) => {
+    if (ctx.mode !== "tui" || restoring || event.source === "restore") {
       return;
     }
 
@@ -76,8 +91,8 @@ export default function rememberModelAndThinking(pi: ExtensionAPI) {
     save();
   });
 
-  pi.on("thinking_level_select", async (event) => {
-    if (restoring || !lastConfig) {
+  pi.on("thinking_level_select", async (event, ctx) => {
+    if (ctx.mode !== "tui" || restoring || !lastConfig) {
       return;
     }
 
@@ -86,6 +101,12 @@ export default function rememberModelAndThinking(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    // Non-interactive hosts own their model selection. SDK hosts using TUI
+    // mode can opt out too; Pi exposes no explicit SDK-model marker here.
+    if (ctx.mode !== "tui" || process.env.PI_REMEMBER_MODEL_DISABLE === "1") {
+      return;
+    }
+
     if (!lastConfig) {
       return;
     }
@@ -100,26 +121,11 @@ export default function rememberModelAndThinking(pi: ExtensionAPI) {
       return;
     }
 
-    // Startup only: respect an explicitly chosen model. `ctx.getModel()`
-    // returns the live session model, already resolved from `--model`/`--models`
-    // before `session_start` fires, and Pi exposes no flag on the event, so the
-    // process arguments are the only reliable signal for an explicit choice.
-    // An in-process "new" session has no new CLI flags and must still inherit
-    // the remembered model.
-    if (event.reason === "startup") {
-      const currentModel = ctx.getModel?.();
-
-      if (
-        currentModel &&
-        (currentModel.provider !== lastConfig.provider ||
-          currentModel.id !== lastConfig.model)
-      ) {
-        return;
-      }
-
-      if (hasExplicitModelArg()) {
-        return;
-      }
+    // Startup only: CLI model selections win over the remembered choice.
+    // A different current model may just be Pi's default, not an explicit
+    // selection. An in-process "new" session must still inherit the saved model.
+    if (event.reason === "startup" && hasExplicitModelArg()) {
+      return;
     }
 
     const model = ctx.modelRegistry.find(
